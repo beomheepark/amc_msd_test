@@ -36,6 +36,7 @@ model = load_model(input_shape=input_shape,
 model.compile(optimizer=Adam(lr=1e-4), loss=average_dice_coef_loss, metrics=[average_dice_coef])
 datagen = data_aug(task)
 
+score = [0.]
 num_steps = 10000
 for n in range(num_steps):
     random.shuffle(train_cases)
