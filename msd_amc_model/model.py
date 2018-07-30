@@ -2,18 +2,17 @@
 # coding: utf-8
 
 import tensorflow as tf
-from tensorflow.python.keras.models import Model
-from tensorflow.python.keras.layers import Dense, Activation, Flatten, Lambda, LeakyReLU, Multiply, Reshape
-from tensorflow.python.keras.layers import Input, Conv3D, MaxPooling3D, UpSampling3D, ZeroPadding3D, Cropping3D, Conv3DTranspose, GlobalAveragePooling3D
-from tensorflow.python.keras.optimizers import Adam
-from tensorflow.python.keras.callbacks import ModelCheckpoint, LearningRateScheduler
-from tensorflow.python.keras.layers import BatchNormalization, GaussianNoise
-from tensorflow.python.keras.layers import concatenate
-from tensorflow.python.keras.preprocessing import sequence
-from tensorflow.python.keras import backend as K
-import memory_saving_gradients
-from msd_amc_preprocess import keras_image3d
-K.__dict__["gradients"] = memory_saving_gradients.gradients_speed
+from keras.models import Model
+from keras import layers
+from keras.layers import Dense, Activation, Flatten, Lambda, LeakyReLU, Multiply, Reshape, ThresholdedReLU
+from keras_contrib.layers import InstanceNormalization
+from keras.layers import Input, Conv3D, MaxPooling3D, UpSampling3D, ZeroPadding3D, Cropping3D, Conv3DTranspose, GlobalAveragePooling3D
+from keras.optimizers import Adam
+from keras.callbacks import ModelCheckpoint, LearningRateScheduler
+from keras.layers import BatchNormalization, GaussianNoise
+from keras.layers import concatenate
+from keras.preprocessing import sequence
+from keras import backend as K
 
 smooth = 1.
 def average_dice_coef(y_true, y_pred):
@@ -29,43 +28,49 @@ def average_dice_coef(y_true, y_pred):
 def average_dice_coef_loss(y_true, y_pred):
     return -average_dice_coef(y_true, y_pred)
 
-def load_model(input_shape, num_labels, base_filter=32, se_block=True, se_ratio=16, noise=0.1):
-    def conv3d(layer_input, filters, axis=-1, se_block=True, se_ratio=16, down_sizing=True):
+def load_model(input_shape, num_labels, axis=-1,base_filter=32, depth_size=4, se_res_block=True, se_ratio=16, noise=0.1, last_relu=False):
+    def conv3d(layer_input, filters, axis=-1, se_res_block=True, se_ratio=16, down_sizing=True):
         if down_sizing == True:
             layer_input = MaxPooling3D(pool_size=(2, 2, 2))(layer_input)
         d = Conv3D(filters, (3, 3, 3), use_bias=False, padding='same')(layer_input)
-        d = BatchNormalization(axis=axis)(d)
+        d = InstanceNormalization(axis=axis)(d)
         d = LeakyReLU(alpha=0.3)(d)
         d = Conv3D(filters, (3, 3, 3), use_bias=False, padding='same')(d)
-        d = BatchNormalization(axis=axis)(d)
-        if se_block == True:
+        d = InstanceNormalization(axis=axis)(d)
+        if se_res_block == True:
             se = GlobalAveragePooling3D()(d)
             se = Dense(filters // se_ratio, activation='relu')(se)
             se = Dense(filters, activation='sigmoid')(se)
             se = Reshape([1, 1, 1, filters])(se)
             d = Multiply()([d, se])
+            shortcut = Conv3D(filters, (3, 3, 3), use_bias=False, padding='same')(layer_input)
+            shortcut = InstanceNormalization(axis=axis)(shortcut)
+            d = layers.add([d, shortcut])
         d = LeakyReLU(alpha=0.3)(d)
         return d
 
-    def deconv3d(layer_input, skip_input, filters, axis=-1, se_block=True, se_ratio=16):
-        u = ZeroPadding3D(((0, 1), (0, 1), (0, 1)))(layer_input)
-        u = Conv3DTranspose(filters, (2, 2, 2), strides=(2, 2, 2), use_bias=False, padding='same')(u)
-        u = BatchNormalization(axis=axis)(u)
-        u = LeakyReLU(alpha=0.3)(u)
-        u = CropToConcat3D()([u, skip_input])
-        u = Conv3D(filters, (3, 3, 3), use_bias=False, padding='same')(u)
-        u = BatchNormalization(axis = axis)(u)
-        u = LeakyReLU(alpha=0.3)(u)
-        u = Conv3D(filters, (3, 3, 3), use_bias=False, padding='same')(u)
-        u = BatchNormalization(axis = axis)(u)
-        if se_block == True:
-            se = GlobalAveragePooling3D()(u)
+    def deconv3d(layer_input, skip_input, filters, axis=-1, se_res_block=True, se_ratio=16):
+        u1 = ZeroPadding3D(((0, 1), (0, 1), (0, 1)))(layer_input)
+        u1 = Conv3DTranspose(filters, (2, 2, 2), strides=(2, 2, 2), use_bias=False, padding='same')(u1)
+        u1 = InstanceNormalization(axis=axis)(u1)
+        u1 = LeakyReLU(alpha=0.3)(u1)
+        u1 = CropToConcat3D()([u1, skip_input])
+        u2 = Conv3D(filters, (3, 3, 3), use_bias=False, padding='same')(u1)
+        u2 = InstanceNormalization(axis = axis)(u2)
+        u2 = LeakyReLU(alpha=0.3)(u2)
+        u2 = Conv3D(filters, (3, 3, 3), use_bias=False, padding='same')(u2)
+        u2 = InstanceNormalization(axis = axis)(u2)
+        if se_res_block == True:
+            se = GlobalAveragePooling3D()(u2)
             se = Dense(filters // se_ratio, activation='relu')(se)
             se = Dense(filters, activation='sigmoid')(se)
             se = Reshape([1, 1, 1, filters])(se)
-            u = Multiply()([u, se])
-        u = LeakyReLU(alpha=0.3)(u)
-        return u
+            u2 = Multiply()([u2, se])
+            shortcut = Conv3D(filters, (3, 3, 3), use_bias=False, padding='same')(u1)
+            shortcut = InstanceNormalization(axis=axis)(shortcut)
+            u2 = layers.add([u2, shortcut])
+        u2 = LeakyReLU(alpha=0.3)(u2)
+        return u2
 
     def CropToConcat3D():
         def crop_to_concat_3D(concat_layers, axis=-1):
@@ -83,37 +88,40 @@ def load_model(input_shape, num_labels, base_filter=32, se_block=True, se_ratio=
 
     input_img = Input(shape=input_shape)
     d0 = GaussianNoise(noise)(input_img)
-    d1 = conv3d(d0, base_filter, se_block=False, down_sizing=False)
-    d2 = conv3d(d1, base_filter*2, se_block=se_block)
-    d3 = conv3d(d2, base_filter*4, se_block=se_block)
-    d4 = conv3d(d3, base_filter*8, se_block=se_block)
-    d5 = conv3d(d4, base_filter*16, se_block=se_block)
-
-    u4 = deconv3d(d5, d4, base_filter*8)
-    u3 = deconv3d(u4, d3, base_filter*4)
-    u2 = deconv3d(u3, d2, base_filter*2)
-    u1 = deconv3d(u2, d1, base_filter, se_block=False)
+    d1 = Conv3D(base_filter, (3, 3, 3), use_bias=False, padding='same')(d0)
+    d1 = InstanceNormalization(axis=axis)(d1)
+    d1 = LeakyReLU(alpha=0.3)(d1)
+    d2 = conv3d(d1, base_filter*2, se_res_block=se_res_block)
+    d3 = conv3d(d2, base_filter*4, se_res_block=se_res_block)
+    d4 = conv3d(d3, base_filter*8, se_res_block=se_res_block)
+    
+    if depth_size == 4:
+        d5 = conv3d(d4, base_filter*16, se_res_block=se_res_block)
+        u4 = deconv3d(d5, d4, base_filter*8, se_res_block=se_res_block)
+        u3 = deconv3d(u4, d3, base_filter*4, se_res_block=se_res_block)
+    elif depth_size == 3:
+        u3 = deconv3d(d4, d3, base_filter*4, se_res_block=se_res_block)
+    else:
+        raise Exception('depth size must be 3 or 4. you put ', depth_size)
+    
+    u2 = deconv3d(u3, d2, base_filter*2, se_res_block=se_res_block)
+    u1 = ZeroPadding3D(((0, 1), (0, 1), (0, 1)))(u2)
+    u1 = Conv3DTranspose(base_filter, (2, 2, 2), strides=(2, 2, 2), use_bias=False, padding='same')(u1)
+    u1 = InstanceNormalization(axis=axis)(u1)
+    u1 = LeakyReLU(alpha=0.3)(u1)
+    u1 = CropToConcat3D()([u1, d1])
+    u1 = Conv3D(base_filter, (3, 3, 3), use_bias=False, padding='same')(u1)
+    u1 = InstanceNormalization(axis = axis)(u1)
+    u1 = LeakyReLU(alpha=0.3)(u1)
     output_img = Conv3D(num_labels, kernel_size=1, strides=1, padding='same', activation='sigmoid')(u1)
-    model = Model(inputs=input_img, outputs=output_img)
-    return model
-
-def data_aug(task):
-    if task == 'Task04_Hippocampus':
-        rotation_range = [3.,3.,3.]
-    elif task == 'Task05_Prostate':
-        rotation_range = [0.,0.,10.]
+    if last_relu == True:
+        output_img = ThresholdedReLU(theta=0.5)(output_img)
+    if roi_model == True:
+        output_roi = Conv3D(1, kernel_size=1, strides=1, padding='same', activation='sigmoid')(d4)
+        output_roi = ThresholdedReLU(theta=0.5)(output_roi)
+        model_roi = Model(inputs=input_img, outputs=output_roi)
+        model_seg = Model(inputs=input_img, outputs=output_img)
+        return model_roi, model_seg
     else:
-        rotation_range = [5.,5.,10.]
-    if task == 'Task01_BrainTumour' or task == 'Task05_Prostate' or task == 'Task06_Lung':
-        horizontal_flip = True
-    else:
-        horizontal_flip = False
-    datagen = keras_image3d.ImageDataGenerator(
-                                        rotation_range=rotation_range, #####################
-                                        zoom_range=[0.9, 1.1],
-                                        width_shift_range=0.1,
-                                        height_shift_range=0.1,
-                                        depth_shift_range=0.1,
-                                        horizontal_flip=horizontal_flip,
-                                        fill_mode='constant',cval=0.)
-    return datagen
+        model = Model(inputs=input_img, outputs=output_img)
+        return model
