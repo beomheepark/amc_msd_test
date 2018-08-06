@@ -10,7 +10,7 @@ from keras.layers import Input, Conv3D, MaxPooling3D, UpSampling3D, ZeroPadding3
 from keras.optimizers import Adam
 from keras.callbacks import ModelCheckpoint, LearningRateScheduler
 from keras.layers import BatchNormalization, GaussianNoise
-from keras.layers import concatenate
+from keras.layers import concatenate, add, multiply
 from keras.preprocessing import sequence
 from keras import backend as K
 
@@ -28,7 +28,7 @@ def average_dice_coef(y_true, y_pred):
 def average_dice_coef_loss(y_true, y_pred):
     return -average_dice_coef(y_true, y_pred)
 
-def load_model(input_shape, num_labels, axis=-1,base_filter=32, depth_size=4, se_res_block=True, se_ratio=16, noise=0.1, last_relu=False):
+def load_model(input_shape, num_labels, axis=-1,base_filter=32, depth_size=4, se_res_block=True, se_ratio=16, noise=0.1, last_relu=False, atten_gate=False):
     def conv3d(layer_input, filters, axis=-1, se_res_block=True, se_ratio=16, down_sizing=True):
         if down_sizing == True:
             layer_input = MaxPooling3D(pool_size=(2, 2, 2))(layer_input)
@@ -45,11 +45,26 @@ def load_model(input_shape, num_labels, axis=-1,base_filter=32, depth_size=4, se
             d = Multiply()([d, se])
             shortcut = Conv3D(filters, (3, 3, 3), use_bias=False, padding='same')(layer_input)
             shortcut = InstanceNormalization(axis=axis)(shortcut)
-            d = layers.add([d, shortcut])
+            d = add([d, shortcut])
         d = LeakyReLU(alpha=0.3)(d)
         return d
 
-    def deconv3d(layer_input, skip_input, filters, axis=-1, se_res_block=True, se_ratio=16):
+    def deconv3d(layer_input, skip_input, filters, axis=-1, se_res_block=True, se_ratio=16, atten_gate=False):
+        if atten_gate == True:
+            gating = Conv3D(filters, (1, 1, 1), use_bias=False, padding='same')(layer_input)
+            gating = InstanceNormalization(axis=axis)(gating)
+            attention = Conv3D(filters, (2, 2, 2), strides=(2, 2, 2), use_bias=False, padding='valid')(skip_input)
+            attention = InstanceNormalization(axis=axis)(attention)
+            attention = add([gating, attention])
+            attention = Conv3D(1, (1, 1, 1), use_bias=False, padding='same', activation='sigmoid')(attention)
+            #attention = Lambda(resize_by_axis, arguments={'dim_1':skip_input.get_shape().as_list()[1],'dim_2':skip_input.get_shape().as_list()[2],'ax':3})(attention) # error when None dimension is feeded.
+            #attention = Lambda(resize_by_axis, arguments={'dim_1':skip_input.get_shape().as_list()[1],'dim_2':skip_input.get_shape().as_list()[3],'ax':2})(attention)
+            attention = ZeroPadding3D(((0, 1), (0, 1), (0, 1)))(attention)
+            attention = UpSampling3D((2, 2, 2))(attention)
+            attention = CropToConcat3D(mode='crop')([attention, skip_input])
+            attention = Lambda(lambda x: K.tile(x, [1,1,1,1,filters]))(attention)
+            skip_input = multiply([skip_input, attention])
+            
         u1 = ZeroPadding3D(((0, 1), (0, 1), (0, 1)))(layer_input)
         u1 = Conv3DTranspose(filters, (2, 2, 2), strides=(2, 2, 2), use_bias=False, padding='same')(u1)
         u1 = InstanceNormalization(axis=axis)(u1)
@@ -68,11 +83,11 @@ def load_model(input_shape, num_labels, axis=-1,base_filter=32, depth_size=4, se
             u2 = Multiply()([u2, se])
             shortcut = Conv3D(filters, (3, 3, 3), use_bias=False, padding='same')(u1)
             shortcut = InstanceNormalization(axis=axis)(shortcut)
-            u2 = layers.add([u2, shortcut])
+            u2 = add([u2, shortcut])
         u2 = LeakyReLU(alpha=0.3)(u2)
         return u2
 
-    def CropToConcat3D():
+    def CropToConcat3D(mode='concat'):
         def crop_to_concat_3D(concat_layers, axis=-1):
             bigger_input,smaller_input = concat_layers
             bigger_shape, smaller_shape = tf.shape(bigger_input), \
@@ -83,8 +98,21 @@ def load_model(input_shape, num_labels, axis=-1,base_filter=32, depth_size=4, se
             cropped_to_smaller_input = bigger_input[:,:-dh,
                                                       :-dw,
                                                       :-dd,:]
-            return K.concatenate([smaller_input,cropped_to_smaller_input], axis=axis)
+            if mode == 'concat':
+                return K.concatenate([smaller_input,cropped_to_smaller_input], axis=axis)
+            elif mode == 'add':
+                return smaller_input+cropped_to_smaller_input
+            elif mode == 'crop':
+                return cropped_to_smaller_input
         return Lambda(crop_to_concat_3D)
+
+    def resize_by_axis(image, dim_1, dim_2, ax): # it is available only for 1 channel 3D
+        resized_list = []
+        unstack_img_depth_list = tf.unstack(image, axis=ax)
+        for i in unstack_img_depth_list:
+            resized_list.append(tf.image.resize_images(i, [dim_1, dim_2])) # defaults to ResizeMethod.BILINEAR
+        stack_img = tf.stack(resized_list, axis=ax+1)
+        return stack_img
 
     input_img = Input(shape=input_shape)
     d0 = GaussianNoise(noise)(input_img)
@@ -97,14 +125,14 @@ def load_model(input_shape, num_labels, axis=-1,base_filter=32, depth_size=4, se
     
     if depth_size == 4:
         d5 = conv3d(d4, base_filter*16, se_res_block=se_res_block)
-        u4 = deconv3d(d5, d4, base_filter*8, se_res_block=se_res_block)
-        u3 = deconv3d(u4, d3, base_filter*4, se_res_block=se_res_block)
+        u4 = deconv3d(d5, d4, base_filter*8, se_res_block=se_res_block, atten_gate=atten_gate)
+        u3 = deconv3d(u4, d3, base_filter*4, se_res_block=se_res_block, atten_gate=atten_gate)
     elif depth_size == 3:
-        u3 = deconv3d(d4, d3, base_filter*4, se_res_block=se_res_block)
+        u3 = deconv3d(d4, d3, base_filter*4, se_res_block=se_res_block, atten_gate=atten_gate)
     else:
         raise Exception('depth size must be 3 or 4. you put ', depth_size)
     
-    u2 = deconv3d(u3, d2, base_filter*2, se_res_block=se_res_block)
+    u2 = deconv3d(u3, d2, base_filter*2, se_res_block=se_res_block, atten_gate=atten_gate)
     u1 = ZeroPadding3D(((0, 1), (0, 1), (0, 1)))(u2)
     u1 = Conv3DTranspose(base_filter, (2, 2, 2), strides=(2, 2, 2), use_bias=False, padding='same')(u1)
     u1 = InstanceNormalization(axis=axis)(u1)
@@ -116,12 +144,5 @@ def load_model(input_shape, num_labels, axis=-1,base_filter=32, depth_size=4, se
     output_img = Conv3D(num_labels, kernel_size=1, strides=1, padding='same', activation='sigmoid')(u1)
     if last_relu == True:
         output_img = ThresholdedReLU(theta=0.5)(output_img)
-    if roi_model == True:
-        output_roi = Conv3D(1, kernel_size=1, strides=1, padding='same', activation='sigmoid')(d4)
-        output_roi = ThresholdedReLU(theta=0.5)(output_roi)
-        model_roi = Model(inputs=input_img, outputs=output_roi)
-        model_seg = Model(inputs=input_img, outputs=output_img)
-        return model_roi, model_seg
-    else:
-        model = Model(inputs=input_img, outputs=output_img)
-        return model
+    model = Model(inputs=input_img, outputs=output_img)
+    return model
