@@ -62,15 +62,27 @@ def random_shift(x, wrg, hrg, drg, row_index=2, col_index=3, dep_index = 1, chan
     return x
 
 
-def random_shear(x, intensity, row_index=1, col_index=2, channel_index=0,
+def random_shear(x, intensity, row_index=2, col_index=3, dep_index=1, channel_index=0,
                  fill_mode='nearest', cval=0.):
-    shear = np.random.uniform(-intensity, intensity)
-    shear_matrix = np.array([[1, -np.sin(shear), 0],
-                             [0, np.cos(shear), 0],
-                             [0, 0, 1]])
+    shear1 = np.random.uniform(-intensity, intensity)
+    shear2 = np.random.uniform(-intensity, intensity)
+    shear3 = np.random.uniform(-intensity, intensity)
+    shear_matrix_z = np.array([[np.cos(shear1),0, 0, 0],
+                             [-np.sin(shear1), 1, 0, 0],
+                             [0, 0, 1, 0],
+                             [0, 0, 0, 1]])
+    shear_matrix_x = np.array([[1,-np.sin(shear2), 0, 0],
+                             [0, np.cos(shear2), 0, 0],
+                             [0, 0, 1, 0],
+                             [0, 0, 0, 1]])
+    shear_matrix_y = np.array([[1,0, -np.sin(shear3), 0],
+                             [0, 1, 0, 0],
+                             [0, 0, np.cos(shear3), 0],
+                             [0, 0, 0, 1]])
+    shear_matrix = np.dot(np.dot(shear_matrix_y, shear_matrix_z), shear_matrix_x)
 
-    h, w = x.shape[row_index], x.shape[col_index]
-    transform_matrix = transform_matrix_offset_center(shear_matrix, h, w)
+    h, w, d = x.shape[row_index], x.shape[col_index], x.shape[dep_index]
+    transform_matrix = transform_matrix_offset_center(shear_matrix, d, w, h)
     x = apply_transform(x, transform_matrix, channel_index, fill_mode, cval)
     return x
 
@@ -343,28 +355,29 @@ class ImageDataGenerator(object):
         img_col_index = self.col_index - 1
         img_channel_index = self.channel_index - 1
 
+        transform_matrix = None
         # use composition of homographies to generate final transform that needs to be applied
         if self.rotation_range:
             theta1 = np.pi / 180 * np.random.uniform(-self.rotation_range[0], self.rotation_range[0])
             theta2 = np.pi / 180 * np.random.uniform(-self.rotation_range[1], self.rotation_range[1])
             theta3 = np.pi / 180 * np.random.uniform(-self.rotation_range[2], self.rotation_range[2])
-        else:
-            theta1 = 0
-            theta2 = 0
-            theta3 = 0
-        rotation_matrix_z = np.array([[np.cos(theta1), -np.sin(theta1), 0, 0],
+
+            rotation_matrix_z = np.array([[np.cos(theta1), -np.sin(theta1), 0, 0],
                                       [np.sin(theta1), np.cos(theta1), 0, 0],
                                       [0, 0, 1, 0],
                                       [0, 0, 0, 1]])
-        rotation_matrix_y = np.array([[np.cos(theta2), 0, -np.sin(theta2), 0],
-                                      [0, 1, 0, 0],
-                                      [np.sin(theta2), 0, np.cos(theta2), 0],
-                                      [0, 0, 0, 1]])
-        rotation_matrix_x = np.array([[1, 0, 0, 0],
-        	                          [0, np.cos(theta3), -np.sin(theta3), 0],
-                                      [0, np.sin(theta3), np.cos(theta3), 0],
-                                      [0, 0, 0, 1]])
-        rotation_matrix = np.dot(np.dot(rotation_matrix_y, rotation_matrix_z), rotation_matrix_x)
+            rotation_matrix_y = np.array([[np.cos(theta2), 0, -np.sin(theta2), 0],
+                                          [0, 1, 0, 0],
+                                          [np.sin(theta2), 0, np.cos(theta2), 0],
+                                          [0, 0, 0, 1]])
+            rotation_matrix_x = np.array([[1, 0, 0, 0],
+                                          [0, np.cos(theta3), -np.sin(theta3), 0],
+                                          [0, np.sin(theta3), np.cos(theta3), 0],
+                                          [0, 0, 0, 1]])
+            rotation_matrix = np.dot(np.dot(rotation_matrix_y, rotation_matrix_z), rotation_matrix_x)
+
+            transform_matrix = rotation_matrix if transform_matrix is None else np.dot(transform_matrix, rotation_matrix)
+        
         if self.height_shift_range:
             tx = np.random.uniform(-self.height_shift_range, self.height_shift_range) * x.shape[img_row_index]
         else:
@@ -378,12 +391,29 @@ class ImageDataGenerator(object):
         else:
             tz = 0
 
+        if self.shear_range:
+            shear1 = np.random.uniform(-self.shear_range, self.shear_range)
+            shear2 = np.random.uniform(-self.shear_range, self.shear_range)
+            shear3 = np.random.uniform(-self.shear_range, self.shear_range)
+            shear_matrix_z = np.array([[np.cos(shear1),0, 0, 0],
+                             [-np.sin(shear1), 1, 0, 0],
+                             [0, 0, 1, 0],
+                             [0, 0, 0, 1]])
+            shear_matrix_x = np.array([[1,-np.sin(shear2), 0, 0],
+                                     [0, np.cos(shear2), 0, 0],
+                                     [0, 0, 1, 0],
+                                     [0, 0, 0, 1]])
+            shear_matrix_y = np.array([[1,0, -np.sin(shear3), 0],
+                                     [0, 1, 0, 0],
+                                     [0, 0, np.cos(shear3), 0],
+                                     [0, 0, 0, 1]])
+            shear_matrix = np.dot(np.dot(shear_matrix_y, shear_matrix_z), shear_matrix_x)
+            transform_matrix = shear_matrix if transform_matrix is None else np.dot(transform_matrix, shear_matrix)
+
         if self.zoom_range[0] == 1 and self.zoom_range[1] == 1:
             zx, zy, zz = 1, 1, 1
         else:
             zx, zy, zz = np.random.uniform(self.zoom_range[0], self.zoom_range[1], 3)
-
-        transform_matrix = rotation_matrix
 
         if tx != 0 or ty != 0 or tz != 0:
             shift_matrix = np.array([[1, 0, 0, tz],
